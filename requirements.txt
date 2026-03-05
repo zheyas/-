@@ -1,0 +1,706 @@
+import pygame
+import sys
+import os
+import random
+import requests
+from typing import Optional, Tuple, Set, List
+
+from strategy.models.player import Player
+from strategy.models.unit import Unit
+from strategy.models.archer import Archer
+from strategy.models.catapult import Catapult
+from strategy.models.horseman import Horseman
+from strategy.models.swordsman import Swordsman
+from strategy.models.warlock import Warlock
+from strategy.models.terrain import Terrain, Grass, Water, Bridge
+from strategy.models.battle_map import BattleMap
+from strategy.controller.game_controller import GameController
+
+# ================== НАСТРОЙКИ ИГРЫ ==================
+CELL_SIZE = 64
+MAP_WIDTH = 10
+MAP_HEIGHT = 10
+RIVER_WIDTH = 2
+RIVER_START_Y = MAP_HEIGHT // 2 - 1
+
+# Адаптивный размер окна
+PANEL_HEIGHT = 280  # увеличенная панель для иконок
+SCREEN_WIDTH = CELL_SIZE * MAP_WIDTH
+SCREEN_HEIGHT = CELL_SIZE * MAP_HEIGHT + PANEL_HEIGHT
+
+# Яркие цвета для иконок способностей
+ABILITY_COLORS = {
+    'curse': (255, 50, 50),  # ярко-красный
+    'curse_available': (255, 200, 0),  # золотой
+    'earthquake': (255, 150, 0),  # оранжевый
+    'earthquake_available': (255, 255, 0),  # жёлтый
+}
+
+# Основные цвета
+COLORS = {
+    'grass': (100, 200, 100),
+    'water': (64, 164, 223),
+    'bridge': (139, 69, 19),
+    'archer': (255, 255, 0),
+    'catapult': (128, 128, 128),
+    'horseman': (255, 0, 0),
+    'swordsman': (0, 255, 0),
+    'warlock': (180, 0, 180),
+    'dead': (0, 0, 0),
+    'selected': (255, 255, 255, 128),
+    'move_highlight': (0, 255, 0, 100),
+    'attack_highlight': (255, 0, 0, 100),
+    'earthquake_range': (255, 165, 0, 150),
+    'text': (255, 255, 255),
+    'panel': (30, 30, 30),
+    'border': (100, 100, 100),
+    'player1_border': (0, 100, 255),
+    'player2_border': (255, 50, 50),
+    'hp_bar_bg': (64, 64, 64),
+    'hp_bar_fg': (0, 255, 0),
+    'ability_bg': (20, 20, 20, 230),
+    'ability_ready': (255, 255, 0),
+    'ability_used': (80, 80, 80),
+}
+
+# ССЫЛКИ НА ИЗОБРАЖЕНИЯ
+IMAGE_URLS = {
+    'archer': 'https://opengameart.org/sites/default/files/archer_0.png',
+    'catapult': 'https://opengameart.org/sites/default/files/catapult_0.png',
+    'horseman': 'https://opengameart.org/sites/default/files/knight_0.png',
+    'swordsman': 'https://opengameart.org/sites/default/files/swordsman_0.png',
+    'warlock': 'https://opengameart.org/sites/default/files/wizard_0.png',
+    'dead': 'https://via.placeholder.com/64/000000/000000?text=+',
+    'grass': 'https://opengameart.org/sites/default/files/grass_0.png',
+    'water': 'https://opengameart.org/sites/default/files/water_0.png',
+    'bridge': 'https://opengameart.org/sites/default/files/bridge_0.png',
+    'curse': 'https://cdn-icons-png.flaticon.com/128/484/484582.png',
+    'trembling_earth': 'https://cdn-icons-png.flaticon.com/128/1791/1791336.png'
+}
+
+
+# ================== ФУНКЦИИ ЗАГРУЗКИ ==================
+def download_image(url: str, save_path: str) -> bool:
+    try:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        if os.path.exists(save_path):
+            return True
+        print(f"Скачивание {url}")
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        with open(save_path, 'wb') as f:
+            f.write(response.content)
+        print(f"✓ Загружено: {save_path}")
+        return True
+    except Exception as e:
+        print(f"✗ Ошибка загрузки {url}: {e}")
+        return False
+
+
+def create_placeholder(path: str, color: Tuple[int, int, int], size: int = 64):
+    try:
+        surf = pygame.Surface((size, size))
+        surf.fill(color)
+        pygame.image.save(surf, path)
+    except Exception as e:
+        pass
+
+
+def ensure_assets():
+    os.makedirs("strategy/assets/units", exist_ok=True)
+    os.makedirs("strategy/assets/ground", exist_ok=True)
+    os.makedirs("strategy/assets/abilities", exist_ok=True)
+
+    for key, url in IMAGE_URLS.items():
+        if key in ('grass', 'water', 'bridge'):
+            path = f"strategy/assets/ground/{key}.png"
+        elif key in ('curse', 'trembling_earth'):
+            path = f"strategy/assets/abilities/{key}.png"
+        else:
+            path = f"strategy/assets/units/{key}.png"
+
+        success = download_image(url, path)
+        if not success:
+            if key == 'curse':
+                create_placeholder(path, (255, 0, 0), 64)
+            elif key == 'trembling_earth':
+                create_placeholder(path, (255, 150, 0), 64)
+
+
+# ================== ИГРОВОЙ КЛАСС ==================
+class GameGUI:
+    def __init__(self):
+        pygame.init()
+        self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.RESIZABLE)
+        pygame.display.set_caption("Strategy Game")
+        self.clock = pygame.time.Clock()
+        self.font = pygame.font.Font(None, 24)
+        self.small_font = pygame.font.Font(None, 18)
+        self.big_font = pygame.font.Font(None, 36)
+
+        ensure_assets()
+        self.images = self.load_images()
+        self.setup_game()
+
+        self.selected_unit = None
+        self.current_player_index = 0
+        self.message = "Выберите юнита"
+        self.message_timer = 0
+        self.possible_moves: Set[Tuple[int, int]] = set()
+        self.ability_mode = False
+        self.ability_type = None
+        self.earthquake_target: Optional[Tuple[int, int]] = None
+
+    def load_images(self) -> dict:
+        images = {}
+        base_path = "strategy/assets"
+
+        paths = {
+            'grass': os.path.join(base_path, "ground", "grass.png"),
+            'water': os.path.join(base_path, "ground", "water.png"),
+            'bridge': os.path.join(base_path, "ground", "bridge.png"),
+            'archer': os.path.join(base_path, "units", "archer.png"),
+            'catapult': os.path.join(base_path, "units", "catapult.png"),
+            'horseman': os.path.join(base_path, "units", "horseman.png"),
+            'swordsman': os.path.join(base_path, "units", "swordsman.png"),
+            'warlock': os.path.join(base_path, "units", "warlock.png"),
+            'dead': os.path.join(base_path, "units", "dead.png"),
+            'curse': os.path.join(base_path, "abilities", "curse.png"),
+            'trembling_earth': os.path.join(base_path, "abilities", "trembling_earth.png")
+        }
+
+        for key, path in paths.items():
+            try:
+                if os.path.exists(path):
+                    img = pygame.image.load(path)
+                    if key in ('curse', 'trembling_earth'):
+                        images[key] = pygame.transform.scale(img, (64, 64))
+                    else:
+                        images[key] = pygame.transform.scale(img, (CELL_SIZE, CELL_SIZE))
+                else:
+                    images[key] = None
+            except Exception as e:
+                images[key] = None
+        return images
+
+    def setup_game(self):
+        self.players = [
+            Player(1, "Синие"),
+            Player(2, "Красные")
+        ]
+
+        ground = []
+        bridge_start_x = random.randint(1, MAP_WIDTH - 3)
+        bridge_end_x = bridge_start_x + 1
+
+        for x in range(MAP_WIDTH):
+            for y in range(MAP_HEIGHT):
+                if RIVER_START_Y <= y < RIVER_START_Y + RIVER_WIDTH:
+                    if bridge_start_x <= x <= bridge_end_x:
+                        ground.append(Bridge(x=x, y=y))
+                    else:
+                        ground.append(Water(x=x, y=y))
+                else:
+                    ground.append(Grass(x=x, y=y))
+
+        free_cells = [(x, y) for x in range(MAP_WIDTH) for y in range(MAP_HEIGHT)
+                      if y < RIVER_START_Y or y >= RIVER_START_Y + RIVER_WIDTH]
+
+        left_cells = [c for c in free_cells if c[0] < MAP_WIDTH // 2]
+        right_cells = [c for c in free_cells if c[0] >= MAP_WIDTH // 2]
+
+        random.shuffle(left_cells)
+        random.shuffle(right_cells)
+
+        units = []
+        unit_types = [Archer, Catapult, Horseman, Swordsman, Warlock]
+
+        for i, cls in enumerate(unit_types):
+            if i < len(left_cells):
+                x, y = left_cells[i]
+                units.append(cls(self.players[0], x=x, y=y))
+
+        for i, cls in enumerate(unit_types):
+            if i < len(right_cells):
+                x, y = right_cells[i]
+                units.append(cls(self.players[1], x=x, y=y))
+
+        self.battle_map = BattleMap(ground=ground, units=units)
+        self.controller = GameController(self.battle_map)
+
+    def remove_dead_units(self):
+        self.battle_map._units = [u for u in self.battle_map.units if u.is_alive()]
+
+    def update_warlock_curses(self):
+        for unit in self.battle_map.units:
+            if isinstance(unit, Warlock) and unit.is_alive():
+                unit.update_curse()
+
+    def reset_warlock_abilities(self):
+        for unit in self.battle_map.units:
+            if isinstance(unit, Warlock) and unit.is_alive():
+                unit.reset_abilities_for_new_turn()
+
+    def compute_possible_moves(self, unit) -> Set[Tuple[int, int]]:
+        moves = set()
+        if not unit or not unit.is_alive():
+            return moves
+        for dx in range(-unit.move_range, unit.move_range + 1):
+            for dy in range(-unit.move_range, unit.move_range + 1):
+                nx, ny = unit.x + dx, unit.y + dy
+                if 0 <= nx < MAP_WIDTH and 0 <= ny < MAP_HEIGHT:
+                    if self.controller.can_move_unit(unit, nx, ny):
+                        moves.add((nx, ny))
+        return moves
+
+    def draw_hp_bar(self, unit, rect):
+        bar_width = CELL_SIZE - 4
+        bar_height = 6
+        bar_x = rect.x + 2
+        bar_y = rect.y - bar_height - 2
+        if bar_y < rect.y - 20:
+            bar_y = rect.y + 2
+
+        pygame.draw.rect(self.screen, COLORS['hp_bar_bg'], (bar_x, bar_y, bar_width, bar_height))
+        fill_width = int(bar_width * unit.health / unit.max_health)
+        if fill_width > 0:
+            pygame.draw.rect(self.screen, COLORS['hp_bar_fg'], (bar_x, bar_y, fill_width, bar_height))
+
+    def draw_earthquake_range(self, center_x: int, center_y: int):
+        for dx in [-1, 0, 1]:
+            for dy in [-1, 0, 1]:
+                x, y = center_x + dx, center_y + dy
+                if 0 <= x < MAP_WIDTH and 0 <= y < MAP_HEIGHT:
+                    rect = pygame.Rect(x * CELL_SIZE, y * CELL_SIZE, CELL_SIZE, CELL_SIZE)
+                    s = pygame.Surface((CELL_SIZE, CELL_SIZE))
+                    s.set_alpha(150)
+                    s.fill(COLORS['earthquake_range'][:3])
+                    self.screen.blit(s, rect)
+
+    def draw_cell(self, x: int, y: int, terrain, unit: Optional = None, highlight: bool = False):
+        rect = pygame.Rect(x * CELL_SIZE, y * CELL_SIZE, CELL_SIZE, CELL_SIZE)
+
+        terrain_img = None
+        if isinstance(terrain, Water):
+            terrain_img = self.images.get('water')
+        elif isinstance(terrain, Bridge):
+            terrain_img = self.images.get('bridge')
+        elif isinstance(terrain, Grass):
+            terrain_img = self.images.get('grass')
+
+        if terrain_img:
+            self.screen.blit(terrain_img, rect)
+        else:
+            color = COLORS['water'] if isinstance(terrain, Water) else \
+                COLORS['bridge'] if isinstance(terrain, Bridge) else COLORS['grass']
+            pygame.draw.rect(self.screen, color, rect)
+
+        if unit:
+            unit_img = None
+            if not unit.is_alive() and self.images.get('dead'):
+                unit_img = self.images['dead']
+            elif isinstance(unit, Archer):
+                unit_img = self.images.get('archer')
+            elif isinstance(unit, Catapult):
+                unit_img = self.images.get('catapult')
+            elif isinstance(unit, Horseman):
+                unit_img = self.images.get('horseman')
+            elif isinstance(unit, Swordsman):
+                unit_img = self.images.get('swordsman')
+            elif isinstance(unit, Warlock):
+                unit_img = self.images.get('warlock')
+
+            if unit_img:
+                self.screen.blit(unit_img, rect)
+            else:
+                color = COLORS['dead'] if not unit.is_alive() else {
+                    Archer: COLORS['archer'],
+                    Catapult: COLORS['catapult'],
+                    Horseman: COLORS['horseman'],
+                    Swordsman: COLORS['swordsman'],
+                    Warlock: COLORS['warlock']
+                }.get(type(unit), COLORS['swordsman'])
+                pygame.draw.rect(self.screen, color, rect)
+
+            if unit.is_alive():
+                self.draw_hp_bar(unit, rect)
+
+            border_color = COLORS['player1_border'] if unit.player == self.players[0] else COLORS['player2_border']
+            pygame.draw.rect(self.screen, border_color, rect, 3)
+
+        pygame.draw.rect(self.screen, COLORS['border'], rect, 1)
+
+        if highlight:
+            s = pygame.Surface((CELL_SIZE, CELL_SIZE))
+            s.set_alpha(100)
+            s.fill(COLORS['move_highlight'][:3])
+            self.screen.blit(s, rect)
+
+        if self.selected_unit == unit:
+            s = pygame.Surface((CELL_SIZE, CELL_SIZE))
+            s.set_alpha(128)
+            s.fill(COLORS['selected'])
+            self.screen.blit(s, rect)
+
+    def draw_ability_bar(self, unit):
+        """Яркая панель способностей для колдуна."""
+        if not isinstance(unit, Warlock) or not unit.is_alive():
+            return
+
+        panel_x = 20
+        panel_y = SCREEN_HEIGHT - 240
+        icon_size = 80
+        spacing = 20
+
+        # Фон панели
+        panel_width = (icon_size * 2) + (spacing * 3)
+        panel_height = icon_size + 80
+        panel_rect = pygame.Rect(panel_x, panel_y, panel_width, panel_height)
+
+        # Полупрозрачный фон
+        s = pygame.Surface((panel_width, panel_height))
+        s.set_alpha(230)
+        s.fill((0, 0, 0))
+        self.screen.blit(s, panel_rect)
+        pygame.draw.rect(self.screen, (255, 255, 255), panel_rect, 2)
+
+        # Заголовок
+        title = self.font.render("⚡ СПОСОБНОСТИ КОЛДУНА ⚡", True, (255, 255, 0))
+        self.screen.blit(title, (panel_x + 10, panel_y + 5))
+
+        # Проклятие
+        curse_icon = self.images.get('curse')
+        if curse_icon:
+            curse_rect = pygame.Rect(panel_x + spacing, panel_y + 40, icon_size, icon_size)
+
+            # Фон под иконкой
+            pygame.draw.rect(self.screen, (30, 30, 30), curse_rect)
+
+            # Иконка
+            self.screen.blit(curse_icon, curse_rect)
+
+            # Рамка (яркая если доступно)
+            if unit.can_use_curse():
+                pygame.draw.rect(self.screen, (255, 255, 0), curse_rect, 4)
+                # Эффект свечения
+                for i in range(3):
+                    pygame.draw.rect(self.screen, (255, 255, 0, 100),
+                                     curse_rect.inflate(i * 2, i * 2), 1)
+            else:
+                pygame.draw.rect(self.screen, (100, 100, 100), curse_rect, 3)
+                # Затемнение
+                s = pygame.Surface((icon_size, icon_size))
+                s.set_alpha(150)
+                s.fill((0, 0, 0))
+                self.screen.blit(s, curse_rect)
+
+            # Клавиша
+            key_bg = pygame.Rect(curse_rect.x + 5, curse_rect.y + 5, 25, 25)
+            pygame.draw.rect(self.screen, (255, 0, 0), key_bg)
+            pygame.draw.rect(self.screen, (255, 255, 255), key_bg, 2)
+            key_text = self.font.render("1", True, (255, 255, 255))
+            self.screen.blit(key_text, (key_bg.x + 8, key_bg.y + 3))
+
+            # Название
+            name_text = self.font.render("ПРОКЛЯТИЕ", True, (255, 100, 100))
+            self.screen.blit(name_text, (curse_rect.x, curse_rect.y + icon_size + 5))
+
+            # Описание
+            desc_text = self.small_font.render("100 урона через 2 хода", True, (200, 200, 200))
+            self.screen.blit(desc_text, (curse_rect.x, curse_rect.y + icon_size + 25))
+
+        # Дрожь земли
+        earth_icon = self.images.get('trembling_earth')
+        if earth_icon:
+            earth_rect = pygame.Rect(panel_x + spacing * 2 + icon_size, panel_y + 40, icon_size, icon_size)
+
+            pygame.draw.rect(self.screen, (30, 30, 30), earth_rect)
+            self.screen.blit(earth_icon, earth_rect)
+
+            if unit.can_use_earthquake():
+                pygame.draw.rect(self.screen, (255, 200, 0), earth_rect, 4)
+                for i in range(3):
+                    pygame.draw.rect(self.screen, (255, 200, 0, 100),
+                                     earth_rect.inflate(i * 2, i * 2), 1)
+            else:
+                pygame.draw.rect(self.screen, (100, 100, 100), earth_rect, 3)
+                s = pygame.Surface((icon_size, icon_size))
+                s.set_alpha(150)
+                s.fill((0, 0, 0))
+                self.screen.blit(s, earth_rect)
+
+            key_bg = pygame.Rect(earth_rect.x + 5, earth_rect.y + 5, 25, 25)
+            pygame.draw.rect(self.screen, (255, 100, 0), key_bg)
+            pygame.draw.rect(self.screen, (255, 255, 255), key_bg, 2)
+            key_text = self.font.render("2", True, (255, 255, 255))
+            self.screen.blit(key_text, (key_bg.x + 8, key_bg.y + 3))
+
+            name_text = self.font.render("ДРОЖЬ ЗЕМЛИ", True, (255, 200, 100))
+            self.screen.blit(name_text, (earth_rect.x, earth_rect.y + icon_size + 5))
+
+            desc_text = self.small_font.render("60 урона в области 3x3", True, (200, 200, 200))
+            self.screen.blit(desc_text, (earth_rect.x, earth_rect.y + icon_size + 25))
+
+    def draw_info_panel(self):
+        # Тёмный фон панели
+        panel_rect = pygame.Rect(0, SCREEN_HEIGHT - PANEL_HEIGHT, SCREEN_WIDTH, PANEL_HEIGHT)
+        pygame.draw.rect(self.screen, (0, 0, 0), panel_rect)
+        pygame.draw.rect(self.screen, (100, 100, 100), panel_rect, 2)
+
+        y_offset = SCREEN_HEIGHT - PANEL_HEIGHT + 10
+
+        # Текущий игрок
+        current_player = self.players[self.current_player_index]
+        player_color = COLORS['player1_border'] if current_player == self.players[0] else COLORS['player2_border']
+        player_text = f"▶ ХОД: {current_player.name} ◀"
+        text = self.big_font.render(player_text, True, player_color)
+        self.screen.blit(text, (SCREEN_WIDTH // 2 - text.get_width() // 2, y_offset))
+
+        if self.selected_unit:
+            info_x = 20
+            info_y = y_offset + 40
+
+            # Тип юнита
+            type_text = f"⚔️ {type(self.selected_unit).__name__}"
+            text = self.font.render(type_text, True, (255, 255, 255))
+            self.screen.blit(text, (info_x, info_y))
+
+            # Здоровье
+            health = self.controller.get_unit_health(self.selected_unit)
+            max_health = self.controller.get_max_health(self.selected_unit)
+            health_text = f"❤️ HP: {health}/{max_health}"
+            health_color = (255, 0, 0) if health < max_health * 0.3 else (0, 255, 0)
+            text = self.font.render(health_text, True, health_color)
+            self.screen.blit(text, (info_x + 200, info_y))
+
+            # Характеристики
+            stats_text = f"⚡ {self.selected_unit.damage}  |  🎯 {self.selected_unit.attack_range}  |  🏃 {self.selected_unit.move_range}"
+            text = self.font.render(stats_text, True, (200, 200, 200))
+            self.screen.blit(text, (info_x, info_y + 25))
+
+            # Панель способностей для колдуна
+            if isinstance(self.selected_unit, Warlock):
+                self.draw_ability_bar(self.selected_unit)
+
+        # Сообщение
+        if self.message_timer > 0:
+            msg_bg = pygame.Rect(SCREEN_WIDTH - 350, y_offset + 10, 330, 60)
+            pygame.draw.rect(self.screen, (0, 0, 0, 200), msg_bg)
+            pygame.draw.rect(self.screen, (255, 255, 0), msg_bg, 2)
+
+            lines = self.message.split('\n')
+            for i, line in enumerate(lines):
+                text = self.font.render(line, True, (255, 255, 0))
+                self.screen.blit(text, (msg_bg.x + 10, msg_bg.y + 10 + i * 20))
+            self.message_timer -= 1
+
+    def get_cell_from_pos(self, pos: Tuple[int, int]) -> Optional[Tuple[int, int]]:
+        x, y = pos
+        if x < 0 or x >= SCREEN_WIDTH or y < 0 or y >= SCREEN_HEIGHT - PANEL_HEIGHT:
+            return None
+        return (x // CELL_SIZE, y // CELL_SIZE)
+
+    def switch_turn(self):
+        self.remove_dead_units()
+        self.update_warlock_curses()
+        self.current_player_index = 1 - self.current_player_index
+        self.reset_warlock_abilities()
+        self.selected_unit = None
+        self.possible_moves.clear()
+        self.ability_mode = False
+        self.ability_type = None
+        self.earthquake_target = None
+
+    def handle_ability(self, unit: Warlock, ability: str):
+        if ability == 'curse':
+            if unit.can_use_curse():
+                self.ability_mode = True
+                self.ability_type = 'curse'
+                self.message = "Выберите цель для проклятия 👻"
+                self.message_timer = 180
+            else:
+                self.message = "❌ Проклятие уже использовано"
+                self.message_timer = 120
+        elif ability == 'earthquake':
+            if unit.can_use_earthquake():
+                self.ability_mode = True
+                self.ability_type = 'earthquake'
+                self.message = "Выберите центр землетрясения 🌋"
+                self.message_timer = 180
+            else:
+                self.message = "❌ Дрожь земли уже использована"
+                self.message_timer = 120
+
+    def handle_click(self, pos: Tuple[int, int], button: int):
+        cell = self.get_cell_from_pos(pos)
+        if not cell:
+            return
+
+        x, y = cell
+
+        if self.ability_mode and self.ability_type == 'earthquake':
+            self.earthquake_target = (x, y)
+
+        unit = self.battle_map.get_unit_at(x, y)
+
+        if button in (2, 3):
+            self.selected_unit = None
+            self.possible_moves.clear()
+            self.ability_mode = False
+            self.ability_type = None
+            self.earthquake_target = None
+            self.message = "Выбор отменён"
+            self.message_timer = 120
+            return
+
+        if button != 1:
+            return
+
+        # Режим проклятия
+        if self.ability_mode and self.ability_type == 'curse' and isinstance(self.selected_unit, Warlock):
+            if unit and unit.player != self.selected_unit.player and unit.is_alive():
+                if self.selected_unit.cast_curse(unit):
+                    self.message = f"👻 Проклятие наложено на {type(unit).__name__}"
+                    self.message_timer = 180
+                    self.switch_turn()
+                else:
+                    self.message = "Не удалось наложить проклятие"
+                    self.message_timer = 120
+            else:
+                self.message = "Нельзя наложить проклятие на эту цель"
+                self.message_timer = 120
+            self.ability_mode = False
+            self.ability_type = None
+            self.earthquake_target = None
+            return
+
+        # Режим дрожи земли
+        if self.ability_mode and self.ability_type == 'earthquake' and isinstance(self.selected_unit, Warlock):
+            damaged = self.selected_unit.cast_earthquake(self.battle_map, x, y)
+            self.message = f"🌋 Дрожь земли поразила {len(damaged)} юнитов"
+            self.message_timer = 180
+            self.switch_turn()
+            self.ability_mode = False
+            self.ability_type = None
+            self.earthquake_target = None
+            return
+
+        # Если есть выбранный юнит
+        if self.selected_unit:
+            if unit and unit.player != self.selected_unit.player:
+                if self.controller.can_attack_unit(self.selected_unit, unit):
+                    self.controller.attack_unit(self.selected_unit, unit)
+                    self.message = f"⚔️ Атака! {type(unit).__name__} получил урон"
+                    self.message_timer = 180
+                    if not unit.is_alive():
+                        self.message = f"💀 {type(unit).__name__} уничтожен!"
+                    self.switch_turn()
+                else:
+                    self.message = "Невозможно атаковать"
+                    self.message_timer = 120
+                return
+
+            if not unit:
+                if self.controller.can_move_unit(self.selected_unit, x, y):
+                    self.controller.move_unit(self.selected_unit, x, y)
+                    self.message = f"🏃 Перемещение на ({x}, {y})"
+                    self.message_timer = 180
+                    self.switch_turn()
+                else:
+                    self.message = "Невозможно переместиться"
+                    self.message_timer = 120
+                return
+
+            if unit and unit.player == self.selected_unit.player:
+                self.selected_unit = unit
+                self.possible_moves = self.compute_possible_moves(unit)
+                self.message = f"Выбран {type(unit).__name__}"
+                self.message_timer = 180
+                return
+
+        # Выбор нового юнита
+        if unit and unit.player == self.players[self.current_player_index] and unit.is_alive():
+            self.selected_unit = unit
+            self.possible_moves = self.compute_possible_moves(unit)
+            self.message = f"Выбран {type(unit).__name__}"
+            self.message_timer = 180
+        else:
+            self.message = "Нельзя выбрать этого юнита"
+            self.message_timer = 120
+
+    def handle_key(self, key: int):
+        if key == pygame.K_SPACE:
+            self.switch_turn()
+            self.message = "⏭️ Ход пропущен"
+            self.message_timer = 120
+        elif key == pygame.K_1 and isinstance(self.selected_unit, Warlock):
+            self.handle_ability(self.selected_unit, 'curse')
+        elif key == pygame.K_2 and isinstance(self.selected_unit, Warlock):
+            self.handle_ability(self.selected_unit, 'earthquake')
+
+    def check_winner(self) -> Optional[Player]:
+        players_alive = {}
+        for unit in self.battle_map.units:
+            if unit.is_alive():
+                players_alive[unit.player] = True
+        if len(players_alive) == 1:
+            return list(players_alive.keys())[0]
+        return None
+
+    def run(self):
+        running = True
+        while running:
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    running = False
+                elif event.type == pygame.VIDEORESIZE:
+                    global SCREEN_WIDTH, SCREEN_HEIGHT
+                    SCREEN_WIDTH, SCREEN_HEIGHT = event.size
+                    self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.RESIZABLE)
+                elif event.type == pygame.MOUSEBUTTONDOWN:
+                    self.handle_click(pygame.mouse.get_pos(), event.button)
+                elif event.type == pygame.KEYDOWN:
+                    self.handle_key(event.key)
+                elif event.type == pygame.MOUSEMOTION:
+                    if self.ability_mode and self.ability_type == 'earthquake':
+                        cell = self.get_cell_from_pos(pygame.mouse.get_pos())
+                        if cell:
+                            self.earthquake_target = cell
+
+            self.screen.fill((0, 0, 0))
+
+            for x in range(MAP_WIDTH):
+                for y in range(MAP_HEIGHT):
+                    terrain = self.battle_map.get_terrain_at(x, y) or Grass(x=x, y=y)
+                    unit = self.battle_map.get_unit_at(x, y)
+                    highlight = (x, y) in self.possible_moves
+                    self.draw_cell(x, y, terrain, unit, highlight)
+
+            if self.earthquake_target:
+                self.draw_earthquake_range(self.earthquake_target[0], self.earthquake_target[1])
+
+            self.draw_info_panel()
+
+            winner = self.check_winner()
+            if winner:
+                win_text = self.big_font.render(f"🏆 ПОБЕДИТЕЛЬ: {winner.name}!", True, (255, 215, 0))
+                text_rect = win_text.get_rect(center=(SCREEN_WIDTH // 2, SCREEN_HEIGHT // 2))
+                s = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
+                s.set_alpha(128)
+                s.fill((0, 0, 0))
+                self.screen.blit(s, (0, 0))
+                self.screen.blit(win_text, text_rect)
+                pygame.display.flip()
+                pygame.time.wait(3000)
+                running = False
+
+            pygame.display.flip()
+            self.clock.tick(60)
+
+        pygame.quit()
+        sys.exit()
+
+
+if __name__ == "__main__":
+    game = GameGUI()
+    game.run()

@@ -3,7 +3,7 @@ from .unit import Unit
 class Catapult(Unit):
     @property
     def max_health(self) -> int:
-        return 70  # по тестам
+        return 70
 
     @property
     def move_range(self) -> int:
