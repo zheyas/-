@@ -32,3 +32,7 @@ class Grass(Terrain):
 class Water(Terrain):
     def is_passable(self) -> bool:
         return False
+
+class Bridge(Terrain):
+    def is_passable(self) -> bool:
+        return True
